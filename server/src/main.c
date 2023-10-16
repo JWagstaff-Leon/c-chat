@@ -1,4 +1,3 @@
-#include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -14,6 +13,7 @@
 #include "connections.h"
 #include "event.h"
 #include "messages.h"
+#include "server.h"
 
 static bool exiting = false;
 
@@ -26,7 +26,7 @@ static void handle_signal(int signal_type)
 
 
 
-int main(int argc, const char *argv[])
+static void set_signal_handler(void)
 {
     struct sigaction signal_action = {.sa_handler = &handle_signal, .sa_flags = 0};
     sigemptyset(&signal_action.sa_mask);
@@ -34,73 +34,57 @@ int main(int argc, const char *argv[])
     sigaction(SIGINT, &signal_action, NULL);
     sigaction(SIGABRT, &signal_action, NULL);
     sigaction(SIGTERM, &signal_action, NULL);
+};
 
-    int master_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if(master_socket < 0)
+
+
+int main(int argc, const char *argv[])
+{
+    set_signal_handler();
+
+    server_t server;
+    if((server_init_result result = server_initialize(&server)) < SINIT_SUCCESS)
     {
-        fprintf(stderr, "Unable to create socket;\n\t%s\n", strerror(errno));
+        switch(result)
+        {
+            case SINIT_SOCKET_FAILED:
+                fprintf(stderr, "Unable to create socket;\n\t%s\n", strerror(errno));
+                break;
+
+            case SINIT_OPTIONS_FAILED:
+                fprintf(stderr, "Unable to set socket options;\n\t%s\n", strerror(errno));
+                break;
+
+            case SINIT_BIND_FAILED:
+                fprintf(stderr, "Unable to bind;\n\t%s\n", strerror(errno));
+                break;
+
+            case SINIT_LISTEN_FAILED:
+                fprintf(stderr, "Unable to listen;\n\t%s\n", strerror(errno));
+                break;
+
+            case SINIT_ALLOCATION_FAILED:
+                fprintf(stderr, "Unable to allocate memory for connections\n");
+                break;
+        }
+        
         return 1;
     }
-
-    int opt = 1;
-    if(setsockopt(master_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)))
-    {
-        fprintf(stderr, "Unable to set socket options;\n\t%s\n", strerror(errno));
-        return 1;
-    }
-
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8080);
-    
-    if(bind(master_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
-    {
-        fprintf(stderr, "Unable to bind;\n\t%s\n", strerror(errno));
-        return 1;
-    }
-    
-    if(listen(master_socket, 16) < 0)
-    {
-        fprintf(stderr, "Unable to listen;\n\t%s\n", strerror(errno));
-        return 1;
-    }
-
-    unsigned char buffer[1025];
-    memset(buffer, '\0', sizeof(buffer));
-
-    int addr_len = sizeof(address);
-
-    connections_t connections;
-    connections.count = 1;
-    connections.size = 8;
-    connections.users = calloc(connections.size, sizeof(user_t));
-
-    if(connections.users == NULL)
-    {
-        fprintf(stderr, "Unable to allocate memory for connections\n");
-        return 1;
-    }
-
-    connections.users[0].username = "Server";
-    connections.users[0].pollfd.fd = master_socket;
-    connections.users[0].pollfd.events = POLLIN;
-    connections.users[0].pollfd.revents = 0;
-
-    for(int i = 1; i < connections.size; i++)
-        connections.users[i] = blank_user;
 
     printf("Server ready;\nWaiting for connections...\n");
     while(!exiting)
     {
+#pragma region update status
         if(!connections_update_fds(&connections))
         {
             fprintf(stderr, "Unable to update fds\n");
             continue;
         }
+#pragma endregion
         
         for(int sender = 1; sender < connections.size; sender++)
         {
+#pragma region check unintroduced users
             if(connections.users[sender].state == USER_CONNECTED && connections.users[sender].pollfd.revents & POLLOUT)
             {
                 unsigned char username_message[] = "Enter username to begin chatting";
@@ -116,12 +100,14 @@ int main(int argc, const char *argv[])
                 send(connections.users[sender].pollfd.fd, username_request, username_request_size, 0);
                 free(username_request);
                 connections.users[sender].state = USER_NO_USERNAME;
-
             }
+#pragma endregion
+
             if(connections.users[sender].pollfd.revents & POLLIN)
             {
                 memset(buffer, '\0', sizeof(buffer));
                 read(connections.users[sender].pollfd.fd, buffer, sizeof(buffer));
+#pragma region check disconnected users
                 if(buffer[0] == '\0')
                 {
                     printf("Client %d disconnected\n", sender);
@@ -140,6 +126,7 @@ int main(int argc, const char *argv[])
                     free(user_leave_event);
                     connections_close_connection(&connections, sender);
                 }
+#pragma endregion
                 else
                 {
                     unsigned char *sanitized = allocate_sanitized_message(buffer);
@@ -213,7 +200,7 @@ int main(int argc, const char *argv[])
     }
 
     printf("\nShutting down\n");
-    connections_shutdown(&connections);
+    server_cleanup(&server);
     shutdown(master_socket, SHUT_RDWR);
     return 0;
 };

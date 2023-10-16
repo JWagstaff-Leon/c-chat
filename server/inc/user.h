@@ -20,4 +20,4 @@ typedef struct {
 
 
 
-static const user_t blank_user = {.username = NULL, .pollfd = {.fd = -1, .events = 0, .revents = 0}, .state = USER_UNINITIALIZED};
+static const user_t blank_user = {.username = NULL, .pollfd = {.fd = -1, .events = -1, .revents = 0}, .state = USER_UNINITIALIZED};
