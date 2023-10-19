@@ -1,5 +1,6 @@
 #include "connections.h"
 
+#include <assert.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -11,47 +12,100 @@
 #include "event.h"
 #include "user.h"
 
-bool connections_update_fds(connections_t *connections)
+connections_t *connections_init(size_t size)
 {
-    struct pollfd *fds = calloc(connections->size, sizeof(struct pollfd));
-    if(fds == NULL)
-    {
-        return false;
-    }
-
-    for(int i = 0; i < connections->size; i++)
-    {
-        fds[i] = connections->users[i].pollfd;
-    }
-
-    poll(fds, connections->size, 0);
-
-    for(int i = 0; i < connections->size; i++)
-    {
-        connections->users[i].pollfd = fds[i];
-    }
-
-    free(fds);
-
-    return true;
+    connections_t *new_connections = malloc(sizeof(connection_t));
+    assert(new_connections != NULL);
+    
+    new_connections->count = 0;
+    new_connections->size = size;
+    
+    new_connections->users = calloc(size, sizeof(user_t));
+    assert(new_connections->users != NULL);
+    
+    new_connections->pollfds = calloc(size, sizeof(pollfd));
+    assert(new_connections->pollfds != NULL);
 };
 
 
 
-void connections_relay_event_from(const connections_t *connections, event_t *event, int sender)
+void connections_destroy(connections_t *connections)
 {
-    for(int reciever = 1; reciever < connections->size; reciever++)
+    unsigned char shutdown_message[] = "Server is shutting down";
+    size_t shutdown_event_size = sizeof(event_t) + sizeof(shutdown_message);
+    event_t *shutdown_event = (event_t *)malloc(shutdown_event_size);
+
+    if(shutdown_event != NULL)
     {
-        if(connections->users[reciever].state > USER_NO_USERNAME && sender != reciever && connections->users[reciever].pollfd.revents & POLLOUT)
+        shutdown_event->code = EVENT_SERVER_SHUTDOWN;
+        shutdown_event->originator_id = 0;
+        shutdown_event->content_length = sizeof(shutdown_message);
+        strcpy(shutdown_event->content, shutdown_message);
+    }
+
+    for(int i = 1; i < connections->size; i++)
+    {
+        if(connections->users[i].state > USER_UNINITIALIZED)
         {
-            send(connections->users[reciever].pollfd.fd, event, event->content_length + sizeof(event_t), 0);
+            if(shutdown_event != NULL)
+                send(connections->users[i].pollfd.fd, shutdown_event, shutdown_event_size, 0);
+
+            connections_close_connection(connections, i);
         }
     }
+
+    free(connections->users);
+    free(connections->pollfds);
+    free(connections);
+    free(shutdown_event);
 };
 
 
 
-void connections_relay_message_from(const connections_t *connections, char *message, int sender)
+void connections_update_fds(connections_t *connections)
+{
+    for(int i = 0; i < connections->size; i++)
+    {
+        connections->pollfds[i] = connections->users[i].pollfd;
+    }
+
+    poll(connections->pollfds, connections->size, 0);
+
+    for(int i = 0; i < connections->size; i++)
+    {
+        connections->users[i].pollfd = connections->pollfds[i];
+    }
+
+    memset(connections->pollfds, 0, sizeof(pollfd) * connections->size);
+};
+
+
+
+void connections_send_event_to_fd(connections_t *connections, event_t *event, int reciever_fd)
+{
+    send(reciever_fd, event, sizeof(event_t), 0);
+    send(reciever_fd, event->content, event->content_length, 0);
+};
+
+
+
+void connections_send_event_to_fd(connections_t *connections, event_t *event, int reciever)
+{
+    connections_send_event_to(connections, event, connections->users[reciever].pollfd.fd);
+};
+
+
+
+void connections_relay_event_from(connections_t *connections, event_t *event, int sender)
+{
+    for(int reciever = 1; reciever < connections->size; reciever++)
+        if(connections->users[reciever].state > USER_NO_USERNAME && sender != reciever && connections->users[reciever].pollfd.revents & POLLOUT)
+            connections_send_event_to(connections, event, reciever);
+};
+
+
+
+void connections_relay_message_from(connections_t *connections, unsigned char *message, int sender)
 {
     size_t decorated_message_length = strlen(connections->users[sender].username) + 3 + strlen(message);
     event_t *message_event = malloc(sizeof(event_t) + decorated_message_length);
@@ -78,33 +132,21 @@ void connections_relay_message_from(const connections_t *connections, char *mess
 
 int connections_add_connection(connections_t *connections, int new_connection, size_t username_size)
 {
-    unsigned char connection_fail_message[] = "Server is unable to handle new connections at the moment.";
-    event_t *connection_fail_event = malloc(sizeof(event_t) + sizeof(connection_fail_message));
-    if(connection_fail_event != NULL)
-    {
-        connection_fail_event->code = EVENT_CONNECTION_FAILED;
-        connection_fail_event->originator_id = 0;
-        connection_fail_event->content_length = strlen(connection_fail_message);
-        strcpy(connection_fail_event->content, connection_fail_message);
-    }
-
     if(connections->count >= connections->size)
     {
         size_t new_size = connections->size * GROW_FACTOR;
         user_t *new_users = reallocarray(connections->users, new_size, sizeof(user_t));
-        if(new_users == NULL)
-        {
-            if(connection_fail_event != NULL)
-                send(new_connection, connection_fail_event, sizeof(event_t) + sizeof(connection_fail_message), 0);
-            close(new_connection);
-            free(connection_fail_event);
+        user_t *new_pollfds = reallocarray(connections->pollfds, new_size, sizeof(pollfd));
+        if(new_users == NULL || new_pollfds == NULL)
             return 0;
-        }
 
         for(int i = connections->size; i < new_size; i++)
             new_users[i] = blank_user;
 
+        memset(new_pollfds[connections->size], 0, (new_size - connections->size) * sizeof(pollfd));
+
         connections->users = new_users;
+        connections->pollfds = new_pollfds;
         connections->size = new_size;
     }
 
@@ -120,7 +162,7 @@ int connections_add_connection(connections_t *connections, int new_connection, s
     free(connection_fail_event);
 
     user_t new_user = {.username = username, .pollfd = {.fd = new_connection, .events = POLLIN | POLLOUT, .revents = 0}, .state = USER_CONNECTED};
-    int insert_position = -1;
+    int insert_position = 0;
     size_t usernames_size = 0;
     unsigned char *usernames = NULL;
     bool user_list_failed = false;
@@ -176,35 +218,4 @@ void connections_close_connection(connections_t *connections, unsigned int index
     free(connections->users[index].username);
     connections->users[index] = blank_user;
     connections->count--;
-};
-
-
-
-void connections_shutdown(connections_t *connections)
-{
-    unsigned char shutdown_message[] = "Server is shutting down";
-    size_t shutdown_event_size = sizeof(event_t) + sizeof(shutdown_message);
-    event_t *shutdown_event = (event_t *)malloc(shutdown_event_size);
-
-    if(shutdown_event != NULL)
-    {
-        shutdown_event->code = EVENT_SERVER_SHUTDOWN;
-        shutdown_event->originator_id = 0;
-        shutdown_event->content_length = sizeof(shutdown_message);
-        strcpy(shutdown_event->content, shutdown_message);
-    }
-
-    for(int i = 1; i < connections->size; i++)
-    {
-        if(connections->users[i].state > USER_UNINITIALIZED)
-        {
-            if(shutdown_event != NULL)
-                send(connections->users[i].pollfd.fd, shutdown_event, shutdown_event_size, 0);
-
-            connections_close_connection(connections, i);
-        }
-    }
-
-    free(connections->users);
-    free(shutdown_event);
 };
