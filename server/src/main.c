@@ -123,6 +123,7 @@ int main(int argc, const char *argv[])
             }
 #pragma endregion
 
+#pragma region handle users input
             if(connections.users[sender].pollfd.revents & POLLIN)
             {
                 event_t *incoming_event = malloc(sizeof(event_t));
@@ -150,7 +151,6 @@ int main(int argc, const char *argv[])
                 unsigned char *sanitized = NULL;
                 switch(incoming_event->code)
                 {
-#pragma region check disconnected users
                     case EVENT_USER_LEAVE:
                     case EVENT_UNDEFINED:
                     default:
@@ -170,7 +170,6 @@ int main(int argc, const char *argv[])
                         free(user_leave_event);
                         connections_close_connection(&connections, sender);
                         break;
-#pragma endregion
 
 
                     case EVENT_USERNAME_REQUEST:
@@ -223,8 +222,9 @@ int main(int argc, const char *argv[])
                 free(incoming_event);
             }
         }
+#pragma endregion
 
-        // new connection
+#pragma region handle new user
         if(connections.users[0].pollfd.revents & POLLIN)
         {
             addr_len = sizeof(address);
@@ -243,6 +243,7 @@ int main(int argc, const char *argv[])
             }
             printf("New connection as client %d\n", add_connection_result);
         }
+#pragma endregion
     }
 
     printf("\nShutting down\n");
