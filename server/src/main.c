@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -15,6 +16,8 @@
 #include "event.h"
 #include "messages.h"
 
+#define MAX_CONTENT_LENGTH 1024
+
 static bool exiting = false;
 
 
@@ -22,6 +25,32 @@ static bool exiting = false;
 static void handle_signal(int signal_type)
 {
     exiting = true;
+};
+
+
+
+static unsigned char username_request_message[] = "Enter username to begin chatting";
+static event_t username_request_event = {
+    .code = EVENT_USERNAME_REQUEST,
+    .originator_id = 0,
+    .content_length = sizeof(username_request_message)
+};
+
+
+
+static unsigned char username_accepted_message[] = "Username set";
+static event_t username_accepted_event = {
+    .code = EVENT_USERNAME_ACCEPTED,
+    .originator_id = 0,
+    .content_length = sizeof(username_accepted_message)
+};
+
+
+
+static event_t oversized_content_event = {
+    .code = EVENT_OVERSIZED_CONTENT,
+    .originator_id = 0,
+    .content_length = 0
 };
 
 
@@ -53,6 +82,7 @@ int main(int argc, const char *argv[])
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(8080);
+    memset(address.sin_zero, 0, sizeof(address.sin_zero));
     
     if(bind(master_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
     {
@@ -75,12 +105,7 @@ int main(int argc, const char *argv[])
     connections.count = 1;
     connections.size = 8;
     connections.users = calloc(connections.size, sizeof(user_t));
-
-    if(connections.users == NULL)
-    {
-        fprintf(stderr, "Unable to allocate memory for connections\n");
-        return 1;
-    }
+    assert(connections.users != NULL);
 
     connections.users[0].username = "Server";
     connections.users[0].pollfd.fd = master_socket;
@@ -103,63 +128,68 @@ int main(int argc, const char *argv[])
         {
             if(connections.users[sender].state == USER_CONNECTED && connections.users[sender].pollfd.revents & POLLOUT)
             {
-                unsigned char username_message[] = "Enter username to begin chatting";
-
-                size_t username_request_size = sizeof(event_t) + sizeof(username_message);
-                event_t *username_request = (event_t *)malloc(username_request_size);
-
-                username_request->code = EVENT_USERNAME_REQUEST;
-                username_request->originator_id = 0;
-                username_request->content_length = sizeof(username_message);
-                strcpy(username_request->content, username_message);
-
-                send(connections.users[sender].pollfd.fd, username_request, username_request_size, 0);
-                free(username_request);
+                send(connections.users[sender].pollfd.fd, &username_request_event, sizeof(event_t), 0);
+                send(connections.users[sender].pollfd.fd, &username_request_message, sizeof(username_request_message), 0);
                 connections.users[sender].state = USER_NO_USERNAME;
-
             }
+
             if(connections.users[sender].pollfd.revents & POLLIN)
             {
-                memset(buffer, '\0', sizeof(buffer));
-                read(connections.users[sender].pollfd.fd, buffer, sizeof(buffer));
-                if(buffer[0] == '\0')
+                event_t *incoming_event = malloc(sizeof(event_t));
+                assert(incoming_event != NULL); // REVIEW maybe don't assert in operating path
+                read(connections.users[sender].pollfd.fd, incoming_event, sizeof(event_t));
+                if(incoming_event->content_length > MAX_CONTENT_LENGTH)
                 {
-                    printf("Client %d disconnected\n", sender);
-                    size_t username_length = strlen(connections.users[sender].username) + 1;
-                    event_t *user_leave_event = malloc(sizeof(event_t) + username_length);
-                    if(user_leave_event != NULL)
-                    {
-                        user_leave_event->code = EVENT_USER_LEAVE;
-                        user_leave_event->originator_id = sender;
-                        user_leave_event->content_length = username_length;
-                        strcpy(user_leave_event->content, connections.users[sender].username);
-                        user_leave_event->content[username_length - 1] = '\0';
+                    send(connections.users[sender].pollfd.fd, &oversized_content_event, sizeof(event_t), 0);
+                    
+                    unsigned char ignore_buffer;
+                    for(
+                        int i = 0;
+                        i < incoming_event->content_length
+                        && read(connections.users[sender].pollfd.fd, &ignore_buffer, 1) > 0;
+                        i++
+                    );
 
-                        connections_relay_event_from(&connections, user_leave_event, sender);
-                    }
-                    free(user_leave_event);
-                    connections_close_connection(&connections, sender);
+                    free(incoming_event);
+                    continue;
                 }
-                else
+
+                incoming_event = realloc(incoming_event, sizeof(event_t) + incoming_event->content_length);
+                assert(incoming_event != NULL); // REVIEW maybe don't assert in operating path
+                read(connections.users[sender].pollfd.fd, incoming_event->content, incoming_event->content_length);
+                unsigned char *sanitized = NULL;
+                switch(incoming_event->code)
                 {
-                    unsigned char *sanitized = allocate_sanitized_message(buffer);
-                    switch(connections.users[sender].state)
-                    {
-                        case USER_NO_USERNAME:
+                    case EVENT_USER_LEAVE:
+                    case EVENT_UNDEFINED:
+                    default:
+                        printf("Client %d disconnected\n", sender);
+                        size_t username_length = strlen(connections.users[sender].username) + 1;
+                        event_t *user_leave_event = malloc(sizeof(event_t) + username_length);
+                        if(user_leave_event != NULL)
+                        {
+                            user_leave_event->code = EVENT_USER_LEAVE;
+                            user_leave_event->originator_id = sender;
+                            user_leave_event->content_length = username_length;
+                            strcpy(user_leave_event->content, connections.users[sender].username);
+                            user_leave_event->content[username_length - 1] = '\0';
+
+                            connections_relay_event_from(&connections, user_leave_event, sender);
+                        }
+                        free(user_leave_event);
+                        connections_close_connection(&connections, sender);
+                        break;
+
+
+                    case EVENT_USERNAME_REQUEST:
+                    case EVENT_USERNAME_SUBMIT:
+                        if(connections.users[sender].state == USER_NO_USERNAME)
+                        {
+                            sanitized = allocate_sanitized_message(incoming_event->content);
                             strcpy(connections.users[sender].username, sanitized);
                             connections.users[sender].username[strlen(connections.users[sender].username)] = '\0';
-
-                            char accpeted_message[] = "Username set";
-                            size_t username_accepted_size = sizeof(event_t) + sizeof(accpeted_message);
-                            event_t *username_accepted = (event_t *)malloc(username_accepted_size);
-
-                            username_accepted->code = EVENT_USERNAME_ACCEPTED;
-                            username_accepted->originator_id = 0;
-                            username_accepted->content_length = sizeof(accpeted_message);
-                            strcpy(username_accepted->content, accpeted_message);
-
-                            send(connections.users[sender].pollfd.fd, username_accepted, username_accepted_size, 0);
-                            free(username_accepted);
+                            send(connections.users[sender].pollfd.fd, &username_accepted_event, sizeof(event_t), 0);
+                            send(connections.users[sender].pollfd.fd, &username_accepted_message, sizeof(username_accepted_message), 0);
 
                             event_t *user_join_event = malloc(sizeof(event_t) + strlen(sanitized) + 1);
                             if(user_join_event != NULL)
@@ -172,29 +202,40 @@ int main(int argc, const char *argv[])
                                 connections_relay_event_from(&connections, user_join_event, sender);
                             }
                             free(user_join_event);
+
                             printf("Client %d set username as %s\n", sender, connections.users[sender].username);
                             connections.users[sender].state = USER_ACTIVE;
+                        }
+                        break;
 
-                            break;
-                        
-                        case USER_ACTIVE:
+
+                    case EVENT_MESSAGE:
+                        if(connections.users[sender].state >= USER_ACTIVE)
+                        {
+                            sanitized = allocate_sanitized_message(incoming_event->content);
                             printf("Got message from client %d:\n%s\n", sender, sanitized);
                             connections_relay_message_from(&connections, sanitized, sender);
-                            break;
+                        }
+                        break;
 
-                        case USER_CONNECTED:
-                        case USER_UNINITIALIZED:
-                        default:
-                            break;
-                    }
-                    free(sanitized);
+                    case EVENT_USERNAME_ACCEPTED:
+                    case EVENT_USERNAME_REJECTED:
+                    case EVENT_CONNECTION_FAILED:
+                    case EVENT_SERVER_SHUTDOWN:
+                    case EVENT_USER_LIST:
+                    case EVENT_USER_JOIN:
+                        // no op
                 }
+
+                free(sanitized);
+                free(incoming_event);
             }
         }
 
         // new connection
         if(connections.users[0].pollfd.revents & POLLIN)
         {
+            addr_len = sizeof(address);
             int new_connection = accept(master_socket, (struct sockaddr *)&address, (socklen_t *)&addr_len);
             if(new_connection < 0)
             {
@@ -215,5 +256,6 @@ int main(int argc, const char *argv[])
     printf("\nShutting down\n");
     connections_shutdown(&connections);
     shutdown(master_socket, SHUT_RDWR);
+    close(master_socket);
     return 0;
 };

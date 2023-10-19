@@ -205,5 +205,6 @@ void connections_shutdown(connections_t *connections)
         }
     }
 
+    free(connections->users);
     free(shutdown_event);
 };
