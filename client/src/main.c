@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <ncurses.h>
@@ -36,6 +37,7 @@ void print_event_to_window(event_t *event, WINDOW *window)
 
 int main(int argc, const char **argv)
 {
+    bool username_sent = false;
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if(server_fd < 0)
     {
@@ -46,8 +48,9 @@ int main(int argc, const char **argv)
     struct sockaddr_in server_address;
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(8080);
+    memset(server_address.sin_zero, 0, sizeof(server_address.sin_zero));
 
-    if(inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) < 0)
+    if(inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) <= 0)
     {
         fprintf(stderr, "Unable to use address;\n\t%s\n", strerror(errno));
         return 1;
@@ -59,7 +62,7 @@ int main(int argc, const char **argv)
         return 1;
     }
 
-    struct pollfd server_connection = {.fd = server_fd, .events = POLLIN | POLLOUT | POLLHUP, .revents = 0};
+    struct pollfd server_connection = {.fd = server_fd, .events = POLLIN | POLLOUT, .revents = 0};
 
 
     initscr();
@@ -153,10 +156,22 @@ int main(int argc, const char **argv)
 
         if(server_connection.revents & POLLOUT && input_buffer.done)
         {
-            write(server_connection.fd, input_buffer.buffer, strlen(input_buffer.buffer));
+            size_t message_event_size = sizeof(event_t) + input_buffer.position + 1;
+            event_t *message_event = malloc(message_event_size);
+            assert(message_event != NULL);
+
+            message_event->code = username_sent ? EVENT_MESSAGE : EVENT_USERNAME_SUBMIT;
+            message_event->originator_id = 0;
+            message_event->content_length = input_buffer.position + 1;
+            memcpy(message_event->content, input_buffer.buffer, message_event->content_length);
+            send(server_connection.fd, message_event, message_event_size, 0);
+            username_sent = true;
+            free(message_event);
+
             memset(input_buffer.buffer, 0, sizeof(input_buffer.buffer));
             input_buffer.position = 0;
             input_buffer.done = false;
+
             wclear(input_window);
             wrefresh(input_window);
         }
@@ -203,7 +218,11 @@ int main(int argc, const char **argv)
         }
     }
 
-    endwin();
+    event_t leave_event = { .code = EVENT_USER_LEAVE, .originator_id = 0, .content_length = 0 };
+    send(server_fd, &leave_event, sizeof(leave_event), 0);
+
+    shutdown(server_fd, SHUT_RDWR);
     close(server_fd);
+    endwin();
     return 0;
 };
