@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 enum user_state {
+    USER_SERVER = -1,
     USER_UNINITIALIZED = 0,
     USER_CONNECTED,
     USER_NO_USERNAME,
