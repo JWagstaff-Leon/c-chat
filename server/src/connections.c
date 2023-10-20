@@ -188,17 +188,17 @@ int connections_add_connection(connections_t *connections, int new_connection)
     }
 
     user_t new_user = {.username = NULL, .pollfd = {.fd = new_connection, .events = POLLIN | POLLOUT, .revents = 0}, .state = USER_CONNECTED};
-    int insert_position = 0;
+    int insert_position = -1;
     size_t usernames_size = 0;
     unsigned char *usernames = NULL;
     bool user_list_failed = false;
     for(int i = 0; i < connections->size; i++)
     {
         // TODO put this all into one spot by summing strlen preeemptively
-        if(!user_list_failed && connections->users[i].state == USER_ACTIVE)
+        if(!user_list_failed && connections->users[i].state == USER_ACTIVE && connections->users[i].username != NULL)
         {
             size_t next_username_size = strlen(connections->users[i].username) + 1;
-            unsigned char *usernames = realloc(usernames, usernames_size + next_username_size);
+            usernames = realloc(usernames, usernames_size + next_username_size);
             if(usernames == NULL)
             {
                 user_list_failed = true;
@@ -208,9 +208,11 @@ int connections_add_connection(connections_t *connections, int new_connection)
             memcpy(&usernames[usernames_size], connections->users[i].username, next_username_size);
             usernames_size += next_username_size;
         }
-        if(insert_position <= 0 && connections->users[i].state == USER_UNINITIALIZED)
+
+        if(insert_position < 0 && connections->users[i].state == USER_UNINITIALIZED)
             insert_position = i;
     }
+
 
     event_t *user_list_event = malloc(sizeof(event_t) + usernames_size);
     if(user_list_event != NULL && usernames != NULL)
@@ -222,12 +224,12 @@ int connections_add_connection(connections_t *connections, int new_connection)
 
         connections_send_event_to_fd(connections, user_list_event, new_user.pollfd.fd);
     }
+    free(usernames);
     free(user_list_event);
 
     connections->users[insert_position] = new_user;
     connections->count++;
 
-    free(usernames);
     return insert_position;
 };
 

@@ -150,12 +150,11 @@ void server_introduce_users(server_t *server)
 {
     for(int user = 1; user < server->connections->size; user++)
     {
-        if(connections_get_user_state(server->connections, user) == USER_UNINITIALIZED
+        if(connections_get_user_state(server->connections, user) == USER_CONNECTED
            && connections_is_connection_writeable(server->connections, user))
         {
-            send(server->connections->users[user].pollfd.fd, &username_request_event, sizeof(event_t), 0);
-            send(server->connections->users[user].pollfd.fd, &username_request_message, sizeof(username_request_message), 0);
-            server->connections->users[user].state = USER_NO_USERNAME;
+            connections_send_event_with_content_to(server->connections, &username_request_event, username_request_message, user);
+            connections_set_user_state(server->connections, user, USER_NO_USERNAME);
         }
     }
 };
@@ -168,7 +167,7 @@ void server_handle_users_input(server_t *server)
     for(int sender = 1; sender < server->connections->size; sender++)
     {
         
-        if(! (server->connections->users[sender].pollfd.revents & POLLIN))
+        if(!connections_is_connection_readable(server->connections, sender))
             continue;
 
         event_t *incoming_event = malloc(sizeof(event_t));
@@ -199,20 +198,25 @@ void server_handle_users_input(server_t *server)
             case EVENT_USER_LEAVE:
             case EVENT_UNDEFINED:
             default:
-                printf("Client %d disconnected\n", sender);
-                size_t username_length = strlen(server->connections->users[sender].username) + 1;
-                event_t *user_leave_event = malloc(sizeof(event_t) + username_length);
-                if(user_leave_event != NULL)
-                {
-                    user_leave_event->code = EVENT_USER_LEAVE;
-                    user_leave_event->originator_id = sender;
-                    user_leave_event->content_length = username_length;
-                    strcpy(user_leave_event->content, server->connections->users[sender].username);
-                    user_leave_event->content[username_length - 1] = '\0';
+                if(server->standard_output != NULL)
+                    fprintf(server->standard_output, "Client %d disconnected\n", sender);
 
-                    connections_relay_event_from(server->connections, user_leave_event, sender);
+                if(connections_get_user_state(server->connections, sender) == USER_ACTIVE)
+                {
+                    size_t username_length = strlen(server->connections->users[sender].username) + 1;
+                    event_t *user_leave_event = malloc(sizeof(event_t) + username_length);
+                    if(user_leave_event != NULL)
+                    {
+                        user_leave_event->code = EVENT_USER_LEAVE;
+                        user_leave_event->originator_id = sender;
+                        user_leave_event->content_length = username_length;
+                        strcpy(user_leave_event->content, server->connections->users[sender].username);
+                        user_leave_event->content[username_length - 1] = '\0';
+
+                        connections_relay_event_from(server->connections, user_leave_event, sender);
+                    }
+                    free(user_leave_event);
                 }
-                free(user_leave_event);
                 connections_close_connection(server->connections, sender);
                 break;
 
@@ -223,7 +227,6 @@ void server_handle_users_input(server_t *server)
                 {
                     sanitized = allocate_sanitized_message(incoming_event->content);
                     server->connections->users[sender].username = sanitized;
-                    // server->connections->users[sender].username[strlen(server->connections->users[sender].username)] = '\0';
                     send(server->connections->users[sender].pollfd.fd, &username_accepted_event, sizeof(event_t), 0);
                     send(server->connections->users[sender].pollfd.fd, &username_accepted_message, sizeof(username_accepted_message), 0);
 
@@ -239,7 +242,8 @@ void server_handle_users_input(server_t *server)
                     }
                     free(user_join_event);
 
-                    printf("Client %d set username as %s\n", sender, server->connections->users[sender].username);
+                    if(server->standard_output != NULL)
+                        fprintf(server->standard_output, "Client %d set username as %s\n", sender, server->connections->users[sender].username);
                     server->connections->users[sender].state = USER_ACTIVE;
                 }
                 break;
@@ -249,8 +253,10 @@ void server_handle_users_input(server_t *server)
                 if(server->connections->users[sender].state >= USER_ACTIVE)
                 {
                     sanitized = allocate_sanitized_message(incoming_event->content);
-                    printf("Got message from client %d:\n%s\n", sender, sanitized);
+                    if(server->standard_output != NULL)
+                        fprintf(server->standard_output, "Got message from client %d:\n%s\n", sender, sanitized);
                     connections_relay_message_from(server->connections, sanitized, sender);
+                    free(sanitized);
                 }
                 break;
 
@@ -263,7 +269,6 @@ void server_handle_users_input(server_t *server)
                 // no op
         }
 
-        free(sanitized);
         free(incoming_event);
     }
 };
